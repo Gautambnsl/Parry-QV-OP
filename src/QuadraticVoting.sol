@@ -48,7 +48,7 @@ contract QuadraticVotingSystem is Ownable {
         string name;
         string description;
         address votingToken;
-        uint256 tokensPerUser;
+        uint256 tokensPerUser;        // Maximum tokens a user gets when joining
         bytes32 schemaId;
         bool isActive;
         uint256 endTime;
@@ -62,15 +62,15 @@ contract QuadraticVotingSystem is Ownable {
         uint256 projectId;
         address creator;
         bool isActive;
-        uint256 totalVotes;
-        mapping(address => uint256) votes;
+        uint256 totalVotesCast;       // Total number of votes cast (not tokens spent)
+        mapping(address => uint256) votes;     // Number of votes cast by user
         mapping(address => bool) hasVoted;
     }
 
     struct UserInfo {
         bool isRegistered;
         mapping(uint256 => bool) projectJoined;
-        mapping(uint256 => uint256) votingPowerLeft;
+        mapping(uint256 => uint256) tokensLeft;    // Remaining tokens for voting
         mapping(uint256 => bytes32) projectAttestations;
     }
 
@@ -82,7 +82,13 @@ contract QuadraticVotingSystem is Ownable {
     event ProjectCreated(uint256 indexed projectId, string name, address admin, bytes32 schemaId);
     event UserJoinedProject(address indexed user, uint256 indexed projectId, bytes32 attestationId);
     event PoolCreated(uint256 indexed projectId, uint256 indexed poolId, string name, address creator);
-    event VoteCast(address indexed user, uint256 indexed projectId, uint256 indexed poolId, uint256 votingPower, uint256 cost);
+    event VoteCast(
+        address indexed user, 
+        uint256 indexed projectId, 
+        uint256 indexed poolId, 
+        uint256 numVotes,         // Number of votes cast
+        uint256 tokensCost        // Tokens spent (numVotes^2)
+    );
 
     constructor(address _easContract) Ownable(msg.sender) {
         easContract = IEAS(_easContract);
@@ -126,7 +132,6 @@ contract QuadraticVotingSystem is Ownable {
         UserInfo storage user = users[msg.sender];
         require(!user.projectJoined[projectId], "Already joined project");
 
-        // Create attestation data
         bytes memory attestationData = abi.encode(project.name, uint256(1));
         
         IEAS.AttestationRequestData memory requestData = IEAS.AttestationRequestData({
@@ -143,7 +148,6 @@ contract QuadraticVotingSystem is Ownable {
             data: requestData
         });
 
-        // Get attestation from EAS
         bytes32 attestationId = easContract.attest{value: msg.value}(request);
         
         project.attestationToUser[attestationId] = msg.sender;
@@ -154,7 +158,7 @@ contract QuadraticVotingSystem is Ownable {
         }
         
         user.projectJoined[projectId] = true;
-        user.votingPowerLeft[projectId] = project.tokensPerUser;
+        user.tokensLeft[projectId] = project.tokensPerUser;
         
         ProjectVotingToken(project.votingToken).mint(msg.sender, project.tokensPerUser);
         
@@ -188,7 +192,7 @@ contract QuadraticVotingSystem is Ownable {
     function castVote(
         uint256 projectId,
         uint256 poolId,
-        uint256 votingPower
+        uint256 numVotes          // Number of votes to cast (will cost numVotes^2 tokens)
     ) external {
         require(projectId < projects.length, "Project does not exist");
         require(poolId < projectPools[projectId].length, "Pool does not exist");
@@ -203,17 +207,18 @@ contract QuadraticVotingSystem is Ownable {
         UserInfo storage user = users[msg.sender];
         require(user.projectJoined[projectId], "Not joined project");
         
-        uint256 voteCost = Math.sqrt(votingPower);
-        require(voteCost <= user.votingPowerLeft[projectId], "Insufficient voting power");
+        // Calculate quadratic cost
+        uint256 tokenCost = numVotes * numVotes;
+        require(tokenCost <= user.tokensLeft[projectId], "Insufficient tokens");
         
-        pool.votes[msg.sender] = votingPower;
-        pool.totalVotes += votingPower;
+        pool.votes[msg.sender] = numVotes;          // Store the number of votes cast
+        pool.totalVotesCast += numVotes;
         pool.hasVoted[msg.sender] = true;
-        user.votingPowerLeft[projectId] -= voteCost;
+        user.tokensLeft[projectId] -= tokenCost;    // Deduct the squared token cost
         
-        ProjectVotingToken(project.votingToken).burn(msg.sender, voteCost);
+        ProjectVotingToken(project.votingToken).burn(msg.sender, tokenCost);
         
-        emit VoteCast(msg.sender, projectId, poolId, votingPower, voteCost);
+        emit VoteCast(msg.sender, projectId, poolId, numVotes, tokenCost);
     }
 
     function getProject(uint256 projectId) external view returns (
@@ -248,7 +253,7 @@ contract QuadraticVotingSystem is Ownable {
         return projectPools[projectId][poolId].votes[voter];
     }
 
-    function getUserVotingPower(uint256 projectId, address user) external view returns (uint256) {
-        return users[user].votingPowerLeft[projectId];
+    function getUserTokensLeft(uint256 projectId, address user) external view returns (uint256) {
+        return users[user].tokensLeft[projectId];
     }
 }
