@@ -4,23 +4,20 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
-import "forge-std/Test.sol";
-import "forge-std/console.sol";
-
 
 interface IEAS {
     struct AttestationRequestData {
-        address recipient;    // The recipient of the attestation
-        uint64 expirationTime;    // The time when the attestation expires (Unix timestamp)
-        bool revocable;      // Whether the attestation is revocable
-        bytes32 refUID;      // The UID of the related attestation
-        bytes data;          // Custom attestation data
-        uint256 value;       // An explicit ETH value to send to the resolver
+        address recipient;
+        uint64 expirationTime;
+        bool revocable;
+        bytes32 refUID;
+        bytes data;
+        uint256 value;
     }
 
     struct AttestationRequest {
-        bytes32 schema;    // The schema UID
-        AttestationRequestData data;  // The attestation data
+        bytes32 schema;
+        AttestationRequestData data;
     }
 
     function attest(AttestationRequest calldata request) external payable returns (bytes32);
@@ -119,19 +116,7 @@ contract QuadraticVotingSystem is Ownable {
         return projectId;
     }
 
-    function encodeSchemaData(
-        string memory projectName, 
-        uint256 allowedToJoin
-    ) public pure returns (bytes memory) {
-        return abi.encode(
-            // First parameter: string projectName
-            projectName,
-            // Second parameter: uint256 allowedToJoin
-            allowedToJoin
-        );
-    }
-
-   function joinProject(uint256 projectId) external payable {
+    function joinProject(uint256 projectId) external payable {
         require(projectId < projects.length, "Project does not exist");
         Project storage project = projects[projectId];
         
@@ -141,33 +126,24 @@ contract QuadraticVotingSystem is Ownable {
         UserInfo storage user = users[msg.sender];
         require(!user.projectJoined[projectId], "Already joined project");
 
-        // Direct encoding
-        bytes memory attestationData = abi.encode(
-            bytes(project.name),  // encode string as bytes
-            uint256(1)           // allowedToJoin
-        );
-
+        // Create attestation data
+        bytes memory attestationData = abi.encode(project.name, uint256(1));
+        
         IEAS.AttestationRequestData memory requestData = IEAS.AttestationRequestData({
             recipient: msg.sender,
             expirationTime: uint64(project.endTime),
             revocable: true,
             refUID: bytes32(0),
             data: attestationData,
-            value: msg.value // forward value
+            value: 0
         });
-
-
-
-        console.log("data is",requestData.data);
-
-
-
 
         IEAS.AttestationRequest memory request = IEAS.AttestationRequest({
             schema: project.schemaId,
             data: requestData
         });
 
+        // Get attestation from EAS
         bytes32 attestationId = easContract.attest{value: msg.value}(request);
         
         project.attestationToUser[attestationId] = msg.sender;
@@ -183,15 +159,6 @@ contract QuadraticVotingSystem is Ownable {
         ProjectVotingToken(project.votingToken).mint(msg.sender, project.tokensPerUser);
         
         emit UserJoinedProject(msg.sender, projectId, attestationId);
-    }
-
-
-    // Helper function to create tuple for schema data
-    function tuple(string memory projectName, uint256 allowedToJoin) internal pure returns (bytes memory) {
-        return abi.encodePacked(
-            bytes(projectName),
-            allowedToJoin
-        );
     }
 
     function createPool(
@@ -249,7 +216,6 @@ contract QuadraticVotingSystem is Ownable {
         emit VoteCast(msg.sender, projectId, poolId, votingPower, voteCost);
     }
 
-    // View functions
     function getProject(uint256 projectId) external view returns (
         string memory name,
         string memory description,

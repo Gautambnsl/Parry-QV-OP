@@ -6,29 +6,34 @@ contract MockEAS {
     mapping(address => bytes32) public lastAttestationId;
     uint256 private nonce;
 
+    struct AttestationRequestData {
+        address recipient;
+        uint64 expirationTime;
+        bool revocable;
+        bytes32 refUID;
+        bytes data;
+        uint256 value;
+    }
+
+    struct AttestationRequest {
+        bytes32 schema;
+        AttestationRequestData data;
+    }
+
     function attest(
         AttestationRequest calldata request
     ) external payable returns (bytes32) {
         bytes32 attestationId = keccak256(
             abi.encodePacked(
-                request.recipient,
+                request.data.recipient,
                 request.schema,
                 nonce++
             )
         );
         
-        hasAttestation[request.recipient][request.schema] = true;
-        lastAttestationId[request.recipient] = attestationId;
+        hasAttestation[request.data.recipient][request.schema] = true;
+        lastAttestationId[request.data.recipient] = attestationId;
         
         return attestationId;
-    }
-
-    struct AttestationRequest {
-        address recipient;
-        bytes32 schema;
-        uint64 expirationTime;
-        bytes32 refUID;
-        bytes data;
-        bool revocable;
     }
 }
