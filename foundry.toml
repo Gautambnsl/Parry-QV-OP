@@ -2,3 +2,7 @@
 src = "src"
 out = "out"
 libs = ["lib"]
+
+
+[rpc_endpoints]
+sepolia = "${OP_TESTNET_RPC}"
