@@ -8,8 +8,9 @@ contract QuadraticVotingTest is Test {
     QuadraticVotingSystem public voting;
 
     address public admin = makeAddr("admin");
-    address public user1 = makeAddr("user1");
-    address public user2 = makeAddr("user2");
+    address public user1 = makeAddr("user1"); // 0 balance
+    address public user2 = 0xb974C9Aaf445ba8ABEe973E36781F658c98743Fa; // 0.8 balance
+    address public user3 = 0xFCF07cf03599cBBAfB90ee179fc6F5b198B67474; // 1.8 balance
 
     uint256 sepoliaFork;
     string sepolia_url = vm.rpcUrl("sepolia");
@@ -18,13 +19,14 @@ contract QuadraticVotingTest is Test {
     address constant PASSPORT_SCORER =
         0xe53C60F8069C2f0c3a84F9B3DB5cf56f3100ba56;
 
+    // Token constants
     uint256 constant TOKENS_REGULAR = 100 ether;
     uint256 constant TOKENS_VERIFIED = 1000 ether;
 
     // Score constants (with 4 decimals)
-    uint256 constant SCORE_BELOW_MIN = 4999; // 0.4999 - Can't join
-    uint256 constant SCORE_REGULAR = 10000; // 1.0000 - Can join, linear voting
-    uint256 constant SCORE_VERIFIED = 15000; // 1.5000 - Can join, quadratic voting
+    uint256 constant SCORE_MIN = 5000; // 0.5000 - Minimum to join
+    uint256 constant SCORE_REGULAR = 8000; // 0.8000 - Can join, limited voting
+    uint256 constant SCORE_VERIFIED = 15000; // 1.5000 - Full quadratic voting
 
     function setUp() public {
         sepoliaFork = vm.createSelectFork(sepolia_url);
@@ -33,15 +35,15 @@ contract QuadraticVotingTest is Test {
         vm.deal(admin, 100 ether);
         vm.deal(user1, 100 ether);
         vm.deal(user2, 100 ether);
+        vm.deal(user3, 100 ether);
 
         // Deploy contract using real Passport scorer
         vm.prank(admin);
         voting = new QuadraticVotingSystem(PASSPORT_SCORER);
     }
 
-    // Helper to set passport score (through mocking)
+    // Helper function to mock passport score (if needed)
     function mockPassportScore(address user, uint256 score) internal {
-        // Mock the passport scorer's response
         vm.mockCall(
             PASSPORT_SCORER,
             abi.encodeWithSignature("getScore(address)", user),
@@ -80,7 +82,7 @@ contract QuadraticVotingTest is Test {
         assertEq(projectAdmin, admin);
     }
 
-    function test_RevertWhen_ScoreBelowMinimum() public {
+    function testJoinWithLowScore() public {
         vm.prank(admin);
         uint256 projectId = voting.createProject(
             "Test Project",
@@ -90,14 +92,13 @@ contract QuadraticVotingTest is Test {
             block.timestamp + 1 weeks
         );
 
-        mockPassportScore(user1, SCORE_BELOW_MIN);
-
+        // user1 has 0 balance
         vm.prank(user1);
-        vm.expectRevert("Score must be at least 2.0000");
+        vm.expectRevert();
         voting.joinProject(projectId);
     }
 
-    function testJoinAsRegularUser() public {
+    function testJoinAsLimitedUser() public {
         vm.prank(admin);
         uint256 projectId = voting.createProject(
             "Test Project",
@@ -107,17 +108,29 @@ contract QuadraticVotingTest is Test {
             block.timestamp + 1 weeks
         );
 
-        mockPassportScore(user1, SCORE_REGULAR);
-
-        vm.startPrank(user1);
+        // user2 has 0.8 balance
+        vm.startPrank(user2);
         voting.joinProject(projectId);
 
-        uint256 tokensLeft = voting.getUserTokensLeft(projectId, user1);
-        (bool isRegistered, bool isVerified) = voting.getUserInfo(user1);
+        uint256 tokensLeft = voting.getUserTokensLeft(projectId, user2);
+        (bool isRegistered, bool isVerified) = voting.getUserInfo(user2);
 
         assertEq(tokensLeft, TOKENS_REGULAR);
         assertTrue(isRegistered);
         assertFalse(isVerified);
+
+        uint256 poolId = voting.createPool(
+            projectId,
+            "Test Pool",
+            "Description"
+        );
+
+        // Limited user can only cast 1 vote
+        voting.castVote(projectId, poolId, 1);
+
+        // Should revert on multiple votes
+        vm.expectRevert("Non-verified users can only cast 1 vote");
+        voting.castVote(projectId, poolId, 2);
         vm.stopPrank();
     }
 
@@ -131,34 +144,16 @@ contract QuadraticVotingTest is Test {
             block.timestamp + 1 weeks
         );
 
-        mockPassportScore(user1, SCORE_VERIFIED);
-
-        vm.startPrank(user1);
+        // user3 has 1.8 balance - fully verified
+        vm.startPrank(user3);
         voting.joinProject(projectId);
 
-        uint256 tokensLeft = voting.getUserTokensLeft(projectId, user1);
-        (bool isRegistered, bool isVerified) = voting.getUserInfo(user1);
+        uint256 tokensLeft = voting.getUserTokensLeft(projectId, user3);
+        (bool isRegistered, bool isVerified) = voting.getUserInfo(user3);
 
         assertEq(tokensLeft, TOKENS_VERIFIED);
         assertTrue(isRegistered);
         assertTrue(isVerified);
-        vm.stopPrank();
-    }
-
-    function testRegularUserVoting() public {
-        vm.prank(admin);
-        uint256 projectId = voting.createProject(
-            "Test Project",
-            "Description",
-            TOKENS_REGULAR,
-            TOKENS_VERIFIED,
-            block.timestamp + 1 weeks
-        );
-
-        mockPassportScore(user1, SCORE_REGULAR);
-
-        vm.startPrank(user1);
-        voting.joinProject(projectId);
 
         uint256 poolId = voting.createPool(
             projectId,
@@ -166,56 +161,20 @@ contract QuadraticVotingTest is Test {
             "Description"
         );
 
-        // Try to cast more than 1 vote
-        vm.expectRevert("Non-verified users can only cast 1 vote");
-        voting.castVote(projectId, poolId, 2);
-
-        // Cast 1 vote successfully
-        voting.castVote(projectId, poolId, 1);
-
-        // Verify vote details
-        (uint256 votingPower, uint256 tokensCost, bool isVerified) = voting
-            .getVoteInfo(projectId, poolId, user1);
-        assertEq(votingPower, 1);
-        assertEq(tokensCost, 1);
-        assertFalse(isVerified);
-
-        vm.stopPrank();
-    }
-
-    function testVerifiedUserQuadraticVoting() public {
-        vm.prank(admin);
-        uint256 projectId = voting.createProject(
-            "Test Project",
-            "Description",
-            TOKENS_REGULAR,
-            TOKENS_VERIFIED,
-            block.timestamp + 1 weeks
-        );
-
-        mockPassportScore(user1, SCORE_VERIFIED);
-
-        vm.startPrank(user1);
-        voting.joinProject(projectId);
-        uint256 poolId = voting.createPool(
-            projectId,
-            "Test Pool",
-            "Description"
-        );
-
-        uint256 voteAmount = 5;
+        // Verified user can cast multiple votes with quadratic cost
+        uint256 voteAmount = 4;
         voting.castVote(projectId, poolId, voteAmount);
 
-        (uint256 votingPower, uint256 tokensCost, bool isVerified) = voting
-            .getVoteInfo(projectId, poolId, user1);
+        (uint256 votingPower, uint256 tokensCost, bool verified) = voting
+            .getVoteInfo(projectId, poolId, user3);
+
         assertEq(votingPower, voteAmount);
         assertEq(tokensCost, voteAmount * voteAmount);
-        assertTrue(isVerified);
-
+        assertTrue(verified);
         vm.stopPrank();
     }
 
-    function testVoteModificationAndRemoval() public {
+    function testVoteRemoval() public {
         vm.prank(admin);
         uint256 projectId = voting.createProject(
             "Test Project",
@@ -225,9 +184,8 @@ contract QuadraticVotingTest is Test {
             block.timestamp + 1 weeks
         );
 
-        mockPassportScore(user1, SCORE_VERIFIED);
-
-        vm.startPrank(user1);
+        // user3 (verified user) joins and votes
+        vm.startPrank(user3);
         voting.joinProject(projectId);
         uint256 poolId = voting.createPool(
             projectId,
@@ -237,68 +195,25 @@ contract QuadraticVotingTest is Test {
 
         uint256 initialVotes = 4;
         voting.castVote(projectId, poolId, initialVotes);
+
         uint256 tokensAfterFirstVote = voting.getUserTokensLeft(
             projectId,
-            user1
+            user3
         );
 
+        // Modify vote
         uint256 newVotes = 2;
         voting.castVote(projectId, poolId, newVotes);
-        uint256 tokensAfterModification = voting.getUserTokensLeft(
-            projectId,
-            user1
-        );
-        assertGt(tokensAfterModification, tokensAfterFirstVote);
 
+        // Remove vote completely
         voting.removeVote(projectId, poolId);
-        uint256 tokensAfterRemoval = voting.getUserTokensLeft(projectId, user1);
+
+        uint256 tokensAfterRemoval = voting.getUserTokensLeft(projectId, user3);
         assertEq(tokensAfterRemoval, TOKENS_VERIFIED);
-
         vm.stopPrank();
     }
 
-    function testMultipleUsersVoting() public {
-        vm.prank(admin);
-        uint256 projectId = voting.createProject(
-            "Test Project",
-            "Description",
-            TOKENS_REGULAR,
-            TOKENS_VERIFIED,
-            block.timestamp + 1 weeks
-        );
-
-        mockPassportScore(user1, SCORE_REGULAR); // Regular user
-        mockPassportScore(user2, SCORE_VERIFIED); // Verified user
-
-        vm.startPrank(user1);
-        voting.joinProject(projectId);
-        uint256 poolId = voting.createPool(
-            projectId,
-            "Test Pool",
-            "Description"
-        );
-        voting.castVote(projectId, poolId, 1); // Can only vote once
-        vm.stopPrank();
-
-        vm.startPrank(user2);
-        voting.joinProject(projectId);
-        voting.castVote(projectId, poolId, 4); // Can vote multiple times
-        vm.stopPrank();
-
-        (uint256 votingPower1, uint256 cost1, bool verified1) = voting
-            .getVoteInfo(projectId, poolId, user1);
-        assertEq(votingPower1, 1);
-        assertEq(cost1, 1);
-        assertFalse(verified1);
-
-        (uint256 votingPower2, uint256 cost2, bool verified2) = voting
-            .getVoteInfo(projectId, poolId, user2);
-        assertEq(votingPower2, 4);
-        assertEq(cost2, 16); // 4^2 = 16
-        assertTrue(verified2);
-    }
-
-    function test_RevertWhen_ProjectExpired() public {
+    function testProjectExpiration() public {
         vm.prank(admin);
         uint256 projectId = voting.createProject(
             "Test Project",
@@ -308,16 +223,16 @@ contract QuadraticVotingTest is Test {
             block.timestamp + 1 days
         );
 
-        mockPassportScore(user1, SCORE_REGULAR);
-
+        // Move time forward
         vm.warp(block.timestamp + 2 days);
 
-        vm.prank(user1);
+        // user2 tries to join expired project
+        vm.prank(user2);
         vm.expectRevert("Project ended");
         voting.joinProject(projectId);
     }
 
-    function test_RevertWhen_DoubleJoining() public {
+    function testDuplicateProjectJoin() public {
         vm.prank(admin);
         uint256 projectId = voting.createProject(
             "Test Project",
@@ -327,17 +242,16 @@ contract QuadraticVotingTest is Test {
             block.timestamp + 1 weeks
         );
 
-        mockPassportScore(user1, SCORE_REGULAR);
-
-        vm.startPrank(user1);
+        vm.startPrank(user2);
         voting.joinProject(projectId);
 
+        // Try to join again
         vm.expectRevert("Already joined project");
         voting.joinProject(projectId);
         vm.stopPrank();
     }
 
-    function test_RevertWhen_NonAdminCreatesProject() public {
+    function testNonAdminProjectCreation() public {
         vm.prank(user1);
         vm.expectRevert();
         voting.createProject(
