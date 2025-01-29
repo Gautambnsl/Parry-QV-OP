@@ -54,24 +54,24 @@ contract QuadraticVotingSystem is Ownable {
     }
 
     struct Vote {
-        uint256 votingPower; // Actual voting power (1 for non-verified, quadratic for verified)
-        uint256 tokensCost; // Tokens spent
-        bool isVerified; // Whether vote was cast as verified user
+        uint256 votingPower;
+        uint256 tokensCost;
+        bool isVerified;
+        bool hasVoted;
     }
 
     struct UserInfo {
         bool isRegistered;
-        bool isVerified; // Whether user has high passport score
+        bool isVerified;
         mapping(uint256 => bool) projectJoined;
         mapping(uint256 => uint256) tokensLeft;
     }
 
+    // Score thresholds (with 4 decimals for Gitcoin Passport)
+    uint256 public constant MIN_SCORE = 5000; // 0.5000 minimum to join
+    uint256 public constant VERIFIED_SCORE = 15000; // 1.5000 for verification
+
     IGitcoinPassport public immutable passportScorer;
-
-    // Constants for score thresholds (considering 4 decimals)
-    uint256 public constant MIN_SCORE = 5000; // 0.5000
-    uint256 public constant VERIFIED_SCORE =  15000; // 1.5000
-
     Project[] public projects;
     mapping(uint256 => Pool[]) public projectPools;
     mapping(address => UserInfo) public users;
@@ -100,6 +100,11 @@ contract QuadraticVotingSystem is Ownable {
         uint256 indexed projectId,
         uint256 indexed poolId,
         uint256 tokensReturned
+    );
+    event UserVerificationUpdated(
+        address indexed user,
+        uint256 indexed projectId,
+        bool isVerified
     );
 
     constructor(address _passportScorer) Ownable(msg.sender) {
@@ -148,11 +153,15 @@ contract QuadraticVotingSystem is Ownable {
         UserInfo storage user = users[msg.sender];
         require(!user.projectJoined[projectId], "Already joined project");
 
-        // Check Gitcoin Passport score
-        uint256 score = passportScorer.getScore(msg.sender);
-        require(score >= MIN_SCORE, "Score must be at least 2.0000");
+        uint256 score;
+        try passportScorer.getScore(msg.sender) returns (uint256 _score) {
+            score = _score;
+        } catch {
+            revert("Score too low to join");
+        }
 
-        // Set verified status if score >= 5.0000
+        require(score >= MIN_SCORE, "Score too low to join");
+
         bool isVerified = score >= VERIFIED_SCORE;
         user.isVerified = isVerified;
 
@@ -160,16 +169,49 @@ contract QuadraticVotingSystem is Ownable {
             user.isRegistered = true;
         }
 
-        // Give appropriate amount of tokens
+        user.projectJoined[projectId] = true;
         uint256 tokens = isVerified
             ? project.tokensPerVerifiedUser
             : project.tokensPerUser;
-        user.projectJoined[projectId] = true;
         user.tokensLeft[projectId] = tokens;
 
         ProjectVotingToken(project.votingToken).mint(msg.sender, tokens);
 
         emit UserJoinedProject(msg.sender, projectId, isVerified);
+    }
+
+    function updateVerification(uint256 projectId) external {
+        require(projectId < projects.length, "Project does not exist");
+        Project storage project = projects[projectId];
+        UserInfo storage user = users[msg.sender];
+
+        require(user.projectJoined[projectId], "Not joined project");
+        require(!user.isVerified, "Already verified");
+        require(project.isActive, "Project not active");
+        require(block.timestamp <= project.endTime, "Project ended");
+
+        uint256 score = passportScorer.getScore(msg.sender);
+        require(
+            score >= VERIFIED_SCORE,
+            "Score not high enough for verification"
+        );
+
+        // Count existing votes
+        uint256 totalVotesCast = 0;
+        Pool[] storage pools = projectPools[projectId];
+        for (uint256 i = 0; i < pools.length; i++) {
+            if (pools[i].userVotes[msg.sender].hasVoted) {
+                totalVotesCast += 1;
+            }
+        }
+
+        // Update verification status and tokens
+        user.isVerified = true;
+        uint256 newTokens = project.tokensPerVerifiedUser - totalVotesCast;
+        user.tokensLeft[projectId] = newTokens;
+        ProjectVotingToken(project.votingToken).mint(msg.sender, newTokens);
+
+        emit UserVerificationUpdated(msg.sender, projectId, true);
     }
 
     function createPool(
@@ -206,7 +248,6 @@ contract QuadraticVotingSystem is Ownable {
     ) external {
         require(projectId < projects.length, "Project does not exist");
         require(poolId < projectPools[projectId].length, "Pool does not exist");
-        require(numVotes > 0, "Must vote at least once");
 
         Project storage project = projects[projectId];
         Pool storage pool = projectPools[projectId][poolId];
@@ -216,48 +257,48 @@ contract QuadraticVotingSystem is Ownable {
         require(block.timestamp <= project.endTime, "Project ended");
         require(user.projectJoined[projectId], "Not joined project");
 
-        // Non-verified users can only cast 1 vote per pool
-        if (!user.isVerified) {
-            require(numVotes == 1, "Non-verified users can only cast 1 vote");
-        }
+        Vote storage userVote = pool.userVotes[msg.sender];
 
-        // Calculate cost and voting power
-        uint256 tokenCost;
-        uint256 votingPower;
-
-        if (user.isVerified) {
-            tokenCost = numVotes * numVotes; // Quadratic cost
-            votingPower = numVotes; // Direct voting power
-        } else {
-            tokenCost = 1; // Fixed cost for non-verified
-            votingPower = 1; // Fixed voting power
-        }
-
-        require(tokenCost <= user.tokensLeft[projectId], "Insufficient tokens");
-
-        // If user has voted before, return their tokens first
-        if (pool.userVotes[msg.sender].votingPower > 0) {
-            user.tokensLeft[projectId] += pool.userVotes[msg.sender].tokensCost;
+        // Return tokens if already voted
+        if (userVote.hasVoted) {
+            user.tokensLeft[projectId] += userVote.tokensCost;
+            pool.totalVotes -= userVote.votingPower;
             ProjectVotingToken(project.votingToken).mint(
                 msg.sender,
-                pool.userVotes[msg.sender].tokensCost
+                userVote.tokensCost
             );
-            pool.totalVotes -= pool.userVotes[msg.sender].votingPower;
         }
 
-        // Update vote
-        pool.userVotes[msg.sender] = Vote({
-            votingPower: votingPower,
-            tokensCost: tokenCost,
-            isVerified: user.isVerified
-        });
+        if (!user.isVerified) {
+            require(numVotes == 1, "Non-verified users can only cast 1 vote");
+            userVote.votingPower = 1;
+            userVote.tokensCost = 1;
+            user.tokensLeft[projectId] -= 1;
+            ProjectVotingToken(project.votingToken).burn(msg.sender, 1);
+        } else {
+            uint256 tokenCost = numVotes * numVotes; // Quadratic cost
+            require(
+                tokenCost <= user.tokensLeft[projectId],
+                "Insufficient tokens"
+            );
 
-        pool.totalVotes += votingPower;
-        user.tokensLeft[projectId] -= tokenCost;
+            userVote.votingPower = numVotes;
+            userVote.tokensCost = tokenCost;
+            user.tokensLeft[projectId] -= tokenCost;
+            ProjectVotingToken(project.votingToken).burn(msg.sender, tokenCost);
+        }
 
-        ProjectVotingToken(project.votingToken).burn(msg.sender, tokenCost);
+        userVote.hasVoted = true;
+        userVote.isVerified = user.isVerified;
+        pool.totalVotes += userVote.votingPower;
 
-        emit VoteCast(msg.sender, projectId, poolId, votingPower, tokenCost);
+        emit VoteCast(
+            msg.sender,
+            projectId,
+            poolId,
+            userVote.votingPower,
+            userVote.tokensCost
+        );
     }
 
     function removeVote(uint256 projectId, uint256 poolId) external {
@@ -267,30 +308,34 @@ contract QuadraticVotingSystem is Ownable {
         Project storage project = projects[projectId];
         Pool storage pool = projectPools[projectId][poolId];
         UserInfo storage user = users[msg.sender];
+        Vote storage userVote = pool.userVotes[msg.sender];
 
         require(project.isActive, "Project not active");
-        require(
-            pool.userVotes[msg.sender].votingPower > 0,
-            "No vote to remove"
-        );
+        require(userVote.hasVoted, "No vote to remove");
 
-        uint256 tokensToReturn = pool.userVotes[msg.sender].tokensCost;
+        uint256 tokensToReturn = userVote.tokensCost;
 
-        // Return tokens
         user.tokensLeft[projectId] += tokensToReturn;
+        pool.totalVotes -= userVote.votingPower;
+
         ProjectVotingToken(project.votingToken).mint(
             msg.sender,
             tokensToReturn
         );
 
-        // Update pool
-        pool.totalVotes -= pool.userVotes[msg.sender].votingPower;
         delete pool.userVotes[msg.sender];
 
         emit VoteRemoved(msg.sender, projectId, poolId, tokensToReturn);
     }
 
     // View functions
+    function getUserInfo(
+        address user
+    ) external view returns (bool isRegistered, bool isVerified) {
+        UserInfo storage userInfo = users[user];
+        return (userInfo.isRegistered, userInfo.isVerified);
+    }
+
     function getVoteInfo(
         uint256 projectId,
         uint256 poolId,
@@ -300,7 +345,7 @@ contract QuadraticVotingSystem is Ownable {
         view
         returns (uint256 votingPower, uint256 tokensCost, bool isVerified)
     {
-        Vote memory vote = projectPools[projectId][poolId].userVotes[voter];
+        Vote storage vote = projectPools[projectId][poolId].userVotes[voter];
         return (vote.votingPower, vote.tokensCost, vote.isVerified);
     }
 
@@ -309,12 +354,5 @@ contract QuadraticVotingSystem is Ownable {
         address user
     ) external view returns (uint256) {
         return users[user].tokensLeft[projectId];
-    }
-
-    function getUserInfo(
-        address user
-    ) external view returns (bool isRegistered, bool isVerified) {
-        UserInfo storage userInfo = users[user];
-        return (userInfo.isRegistered, userInfo.isVerified);
     }
 }
