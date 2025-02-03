@@ -17,7 +17,7 @@ contract FactoryTest is Test {
     address public user4 = makeAddr("user4");
 
     uint256 sepoliaFork;
-    string sepolia_url = vm.rpcUrl("sepolia");
+    string sepolia_url = vm.rpcUrl("optimism_sepolia");
 
     // OP Testnet passport scorer
     address constant PASSPORT_SCORER = 0xe53C60F8069C2f0c3a84F9B3DB5cf56f3100ba56;
