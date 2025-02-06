@@ -2,23 +2,76 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/math/Math.sol";
-import "./Factory.sol";
-import "./ProjectVotingToken.sol";
 
 interface IGitcoinPassport {
     function getScore(address account) external view returns (uint256);
 }
 
+contract Factory is Ownable {
+    address public immutable passportScorer;
+    address[] public projects;
+    
+    event ProjectCreated(
+        address indexed projectAddress, 
+        string name, 
+        address indexed admin,
+        string ipfsHash
+    );
+
+    constructor(address _passportScorer) Ownable(msg.sender) {
+        passportScorer = _passportScorer;
+    }
+
+    function createProject(
+        string calldata name,
+        string calldata description,
+        string calldata ipfsHash,
+        uint256 tokensPerUser,
+        uint256 tokensPerVerifiedUser,
+        uint256 minScoreToJoin,
+        uint256 minScoreToVerify,
+        uint256 endTime
+    ) external returns (address projectAddress) {
+        if (bytes(name).length == 0) revert("Name required");
+        if (bytes(ipfsHash).length == 0) revert("IPFS hash required");
+        if (tokensPerVerifiedUser <= tokensPerUser) revert("Invalid token amounts");
+        if (minScoreToJoin == 0) revert("Min score must be > 0");
+        if (minScoreToVerify <= minScoreToJoin) revert("Invalid score thresholds");
+        if (endTime <= block.timestamp) revert("Invalid end time");
+        
+        projectAddress = address(new QuadraticVoting(
+            name,
+            description,
+            ipfsHash,
+            tokensPerUser,
+            tokensPerVerifiedUser,
+            minScoreToJoin,
+            minScoreToVerify,
+            endTime,
+            passportScorer,
+            msg.sender
+        ));
+        
+        projects.push(projectAddress);
+        emit ProjectCreated(projectAddress, name, msg.sender, ipfsHash);
+    }
+
+    function getProjects() external view returns (address[] memory) {
+        return projects;
+    }
+}
+
 contract QuadraticVoting is Ownable {
-    struct Poll {
+    struct PollCore {
         string name;
         string description;
         address creator;
         bool isActive;
+    }
+
+    struct PollStats {
         uint256 totalVotes;
         uint256 totalParticipants;
-        mapping(address => Vote) userVotes;
     }
 
     struct Vote {
@@ -37,37 +90,36 @@ contract QuadraticVoting is Ownable {
     }
 
     // Project Configuration
-    string public name;
-    string public description;
-    address public immutable votingToken;
-    uint256 public immutable tokensPerUser;
-    uint256 public immutable tokensPerVerifiedUser;
-    uint256 public immutable minScoreToJoin;
-    uint256 public immutable minScoreToVerify;
-    uint256 public immutable endTime;
+    struct ProjectConfig {
+        string name;
+        string description;
+        string ipfsHash;
+        uint256 tokensPerUser;
+        uint256 tokensPerVerifiedUser;
+        uint256 minScoreToJoin;
+        uint256 minScoreToVerify;
+        uint256 endTime;
+    }
+
+    ProjectConfig public config;
 
     // Constants
     uint256 private constant MAX_VOTING_POWER = 1000;
     uint256 private constant SCORE_CHECK_TIMEOUT = 1 hours;
-    uint256 private constant MAX_POLLS_PER_USER = 100;
     uint256 private constant MAX_VOTED_POLLS = 1000;
 
     // State
     IGitcoinPassport public immutable passportScorer;
-    Poll[] public polls;
+    mapping(uint256 => PollCore) public pollsCore;
+    mapping(uint256 => PollStats) public pollsStats;
+    mapping(uint256 => mapping(address => Vote)) public votes;
     mapping(address => UserInfo) public users;
     uint256 public totalParticipants;
+    uint256 public pollCount;
 
-    // Events
     event UserJoined(address indexed user, bool isVerified, uint256 tokens);
-    event PollCreated(uint256 indexed pollId, string name, address indexed creator);
-    event VoteCast(
-        address indexed user, 
-        uint256 indexed pollId, 
-        uint256 votingPower, 
-        bool isVerified,
-        uint256 cost
-    );
+    event PollCreated(uint256 indexed pollId, string name, address indexed creator, string ipfsHash);
+    event VoteCast(address indexed user, uint256 indexed pollId, uint256 votingPower, bool isVerified, uint256 cost);
     event VoteRemoved(address indexed user, uint256 indexed pollId, uint256 tokensReturned);
     event UserVerificationUpdated(address indexed user, bool isVerified, uint256 additionalTokens);
     event PollStatusChanged(uint256 indexed pollId, bool isActive);
@@ -75,6 +127,7 @@ contract QuadraticVoting is Ownable {
     constructor(
         string memory _name,
         string memory _description,
+        string memory _ipfsHash,
         uint256 _tokensPerUser,
         uint256 _tokensPerVerifiedUser,
         uint256 _minScoreToJoin,
@@ -83,69 +136,101 @@ contract QuadraticVoting is Ownable {
         address _passportScorer,
         address _admin
     ) Ownable(_admin) {
-        require(bytes(_name).length > 0, "Name required");
-        require(_tokensPerVerifiedUser > _tokensPerUser, "Invalid token amounts");
-        require(_minScoreToJoin > 0, "Min score must be > 0");
-        require(_minScoreToVerify > _minScoreToJoin, "Invalid score thresholds");
-        require(_endTime > block.timestamp, "Invalid end time");
-        require(_passportScorer != address(0), "Invalid passport scorer");
+        if (_passportScorer == address(0)) revert("Invalid passport scorer");
         
-        name = _name;
-        description = _description;
-        tokensPerUser = _tokensPerUser;
-        tokensPerVerifiedUser = _tokensPerVerifiedUser;
-        minScoreToJoin = _minScoreToJoin;
-        minScoreToVerify = _minScoreToVerify;
-        endTime = _endTime;
+        config = ProjectConfig({
+            name: _name,
+            description: _description,
+            ipfsHash: _ipfsHash,
+            tokensPerUser: _tokensPerUser,
+            tokensPerVerifiedUser: _tokensPerVerifiedUser,
+            minScoreToJoin: _minScoreToJoin,
+            minScoreToVerify: _minScoreToVerify,
+            endTime: _endTime
+        });
+        
         passportScorer = IGitcoinPassport(_passportScorer);
-
-        string memory tokenName = string(abi.encodePacked("Vote ", _name));
-        string memory tokenSymbol = string(abi.encodePacked("v", _name));
-        votingToken = address(new ProjectVotingToken(tokenName, tokenSymbol, address(this)));
     }
 
-  
+    struct ProjectDetails {
+        string name;
+        string description;
+        string ipfsHash;
+        uint256 tokensPerUser;
+        uint256 tokensPerVerifiedUser;
+        uint256 minScoreToJoin;
+        uint256 minScoreToVerify;
+        uint256 endTime;
+        address owner;
+        uint256 totalParticipants;
+        uint256 totalPolls;
+    }
 
-    function joinProject() external  {
-        require(!users[msg.sender].isRegistered, "Already joined");
-        require(totalParticipants < type(uint256).max - 1, "Too many participants");
+    function getProjectInfo() external view returns (ProjectDetails memory) {
+        return ProjectDetails({
+            name: config.name,
+            description: config.description,
+            ipfsHash: config.ipfsHash,
+            tokensPerUser: config.tokensPerUser,
+            tokensPerVerifiedUser: config.tokensPerVerifiedUser,
+            minScoreToJoin: config.minScoreToJoin,
+            minScoreToVerify: config.minScoreToVerify,
+            endTime: config.endTime,
+            owner: owner(),
+            totalParticipants: totalParticipants,
+            totalPolls: pollCount
+        });
+    }
+
+    function joinProject() external {
+        if (users[msg.sender].isRegistered) revert("Already joined");
+        if (totalParticipants >= type(uint256).max - 1) revert("Too many participants");
+        if (block.timestamp > config.endTime) revert("Project ended");
 
         uint256 score = passportScorer.getScore(msg.sender);
-        require(score >= minScoreToJoin, "Score too low to join");
+        if (score < config.minScoreToJoin) revert("Score too low to join");
 
-        bool isVerified = score >= minScoreToVerify;
-        uint256 tokens = isVerified ? tokensPerVerifiedUser : tokensPerUser;
+        bool isVerified = score >= config.minScoreToVerify;
+        uint256 tokens = isVerified ? config.tokensPerVerifiedUser : config.tokensPerUser;
 
-        UserInfo storage user = users[msg.sender];
-        user.isRegistered = true;
-        user.isVerified = isVerified;
-        user.tokensLeft = tokens;
-        user.lastScoreCheck = block.timestamp;
+        users[msg.sender] = UserInfo({
+            isRegistered: true,
+            isVerified: isVerified,
+            tokensLeft: tokens,
+            votedPolls: new uint256[](0),
+            lastScoreCheck: block.timestamp
+        });
 
         totalParticipants++;
-        ProjectVotingToken(votingToken).mint(msg.sender, tokens);
-        
         emit UserJoined(msg.sender, isVerified, tokens);
     }
 
     function createPoll(
-        string memory _name,
-        string memory _description
-    ) external returns (uint256) {
-        require(users[msg.sender].isRegistered, "Must join first");
-        require(bytes(_name).length > 0, "Name required");
-        require(polls.length < type(uint256).max - 1, "Too many polls");
+        string calldata _name,
+        string calldata _description,
+        string calldata _ipfsHash
+    ) external returns (uint256 pollId) {
+        if (!users[msg.sender].isRegistered) revert("Must join first");
+        if (bytes(_name).length == 0) revert("Name required");
+        if (bytes(_ipfsHash).length == 0) revert("IPFS hash required");
         
-        Poll storage newPoll = polls.push();
-        newPoll.name = _name;
-        newPoll.description = _description;
-        newPoll.creator = msg.sender;
-        newPoll.isActive = true;
+        pollId = pollCount++;
         
-        uint256 pollId = polls.length - 1;
-        emit PollCreated(pollId, _name, msg.sender);
-        return pollId;
+        pollsCore[pollId] = PollCore({
+            name: _name,
+            description: _description,
+            creator: msg.sender,
+            isActive: true
+        });
+        
+        pollsStats[pollId] = PollStats({
+            totalVotes: 0,
+            totalParticipants: 0
+        });
+        
+        emit PollCreated(pollId, _name, msg.sender, _ipfsHash);
     }
+
 
     function _checkAndUpdateVerification(UserInfo storage user) internal returns (bool) {
         if (!user.isVerified && 
@@ -154,11 +239,10 @@ contract QuadraticVoting is Ownable {
             uint256 score = passportScorer.getScore(msg.sender);
             user.lastScoreCheck = block.timestamp;
             
-            if (score >= minScoreToVerify) {
+            if (score >= config.minScoreToVerify) {
                 user.isVerified = true;
-                uint256 additionalTokens = tokensPerVerifiedUser - tokensPerUser;
+                uint256 additionalTokens = config.tokensPerVerifiedUser - config.tokensPerUser;
                 user.tokensLeft += additionalTokens;
-                ProjectVotingToken(votingToken).mint(msg.sender, additionalTokens);
                 emit UserVerificationUpdated(msg.sender, true, additionalTokens);
                 return true;
             }
@@ -166,25 +250,54 @@ contract QuadraticVoting is Ownable {
         return false;
     }
 
-    function castVote(
-        uint256 pollId, 
-        uint256 votingPower
-    ) external  {
-        require(pollId < polls.length, "Poll does not exist");
-        require(votingPower > 0 && votingPower <= MAX_VOTING_POWER, "Invalid voting power");
+    struct PollView {
+        string name;
+        string description;
+        address creator;
+        bool isActive;
+        uint256 totalVotes;
+        uint256 totalParticipants;
+    }
+
+    function getPollInfo(uint256 pollId) external view returns (PollView memory) {
+        if (pollId >= pollCount) revert("Poll does not exist");
+        
+        PollCore storage core = pollsCore[pollId];
+        PollStats storage stats = pollsStats[pollId];
+        
+        return PollView({
+            name: core.name,
+            description: core.description,
+            creator: core.creator,
+            isActive: core.isActive,
+            totalVotes: stats.totalVotes,
+            totalParticipants: stats.totalParticipants
+        });
+    }
+
+    function castVote(uint256 pollId, uint256 votingPower) external {
+        if (pollId >= pollCount) revert("Poll does not exist");
+        if (votingPower == 0 || votingPower > MAX_VOTING_POWER) revert("Invalid voting power");
 
         UserInfo storage user = users[msg.sender];
-        require(user.isRegistered, "Not joined");
-        require(user.votedPolls.length < MAX_VOTED_POLLS, "Too many votes");
+        if (!user.isRegistered) revert("Not joined");
+        if (user.votedPolls.length >= MAX_VOTED_POLLS) revert("Too many votes");
 
-        // Check for verification upgrade
+        PollCore storage core = pollsCore[pollId];
+        if (!core.isActive) revert("Poll not active");
+        if (core.creator == msg.sender) revert("Cannot vote on own poll");
+
         _checkAndUpdateVerification(user);
+        _processVote(pollId, votingPower, user);
+    }
 
-        Poll storage poll = polls[pollId];
-        require(poll.isActive, "Poll not active");
-        require(poll.creator != msg.sender, "Cannot vote on own poll");
-
-        Vote storage userVote = poll.userVotes[msg.sender];
+    function _processVote(
+        uint256 pollId,
+        uint256 votingPower,
+        UserInfo storage user
+    ) internal {
+        Vote storage userVote = votes[pollId][msg.sender];
+        PollStats storage stats = pollsStats[pollId];
 
         // Handle previous vote refund
         if (userVote.hasVoted) {
@@ -192,24 +305,23 @@ contract QuadraticVoting is Ownable {
                 userVote.votingPower * userVote.votingPower : 1;
                 
             user.tokensLeft += refundAmount;
-            poll.totalVotes -= userVote.votingPower;
-            ProjectVotingToken(votingToken).mint(msg.sender, refundAmount);
+            stats.totalVotes -= userVote.votingPower;
         }
 
         // Calculate new vote cost
         uint256 voteCost;
         if (!user.isVerified) {
-            require(votingPower == 1, "Regular users can only cast 1 vote");
+            if (votingPower != 1) revert("Regular users can only cast 1 vote");
             voteCost = 1;
         } else {
             voteCost = votingPower * votingPower;
         }
 
-        require(user.tokensLeft >= voteCost, "Insufficient tokens");
+        if (user.tokensLeft < voteCost) revert("Insufficient tokens");
 
         // Apply vote
         if (!userVote.hasVoted) {
-            poll.totalParticipants++;
+            stats.totalParticipants++;
             user.votedPolls.push(pollId);
         }
 
@@ -219,78 +331,51 @@ contract QuadraticVoting is Ownable {
         userVote.timestamp = block.timestamp;
         
         user.tokensLeft -= voteCost;
-        poll.totalVotes += votingPower;
-        
-        ProjectVotingToken(votingToken).burn(msg.sender, voteCost);
+        stats.totalVotes += votingPower;
 
         emit VoteCast(msg.sender, pollId, votingPower, user.isVerified, voteCost);
     }
 
-    function removeVote(
-        uint256 pollId
-    ) external {
-        require(pollId < polls.length, "Poll does not exist");
+    function removeVote(uint256 pollId) external {
+        if (pollId >= pollCount) revert("Poll does not exist");
         
         UserInfo storage user = users[msg.sender];
-        Poll storage poll = polls[pollId];
-        Vote storage userVote = poll.userVotes[msg.sender];
+        Vote storage userVote = votes[pollId][msg.sender];
+        PollStats storage stats = pollsStats[pollId];
         
-        require(userVote.hasVoted, "No vote to remove");
+        if (!userVote.hasVoted) revert("No vote to remove");
 
         uint256 refundAmount = userVote.isVerified ? 
             userVote.votingPower * userVote.votingPower : 1;
 
         user.tokensLeft += refundAmount;
-        poll.totalVotes -= userVote.votingPower;
-        poll.totalParticipants--;
-        ProjectVotingToken(votingToken).mint(msg.sender, refundAmount);
+        stats.totalVotes -= userVote.votingPower;
+        stats.totalParticipants--;
 
         removeFromArray(user.votedPolls, pollId);
-        delete poll.userVotes[msg.sender];
+        delete votes[pollId][msg.sender];
         
         emit VoteRemoved(msg.sender, pollId, refundAmount);
     }
 
-    // Admin functions
     function togglePollStatus(uint256 pollId) external onlyOwner {
-        require(pollId < polls.length, "Poll does not exist");
-        polls[pollId].isActive = !polls[pollId].isActive;
-        emit PollStatusChanged(pollId, polls[pollId].isActive);
+        if (pollId >= pollCount) revert("Poll does not exist");
+        pollsCore[pollId].isActive = !pollsCore[pollId].isActive;
+        emit PollStatusChanged(pollId, pollsCore[pollId].isActive);
     }
 
-
-    // View functions
-    function getPollInfo(uint256 pollId) external view returns (
-        string memory _name,
-        string memory _description,
-        address _creator,
-        bool _isActive,
-        uint256 _totalVotes,
-        uint256 _totalParticipants
-    ) {
-        require(pollId < polls.length, "Poll does not exist");
-        Poll storage poll = polls[pollId];
-        return (
-            poll.name,
-            poll.description,
-            poll.creator,
-            poll.isActive,
-            poll.totalVotes,
-            poll.totalParticipants
-        );
+    function getUserVotedPolls(address user) external view returns (uint256[] memory) {
+        return users[user].votedPolls;
     }
 
-    function getVoteInfo(
-        uint256 pollId, 
-        address voter
-    ) external view returns (
+    function getVoteInfo(uint256 pollId, address voter) external view returns (
         uint256 votingPower,
         bool hasVoted,
         bool isVerified,
         uint256 timestamp
     ) {
-        require(pollId < polls.length, "Poll does not exist");
-        Vote storage vote = polls[pollId].userVotes[voter];
+        if (pollId >= pollCount) revert("Poll does not exist");
+        Vote storage vote = votes[pollId][voter];
         return (
             vote.votingPower,
             vote.hasVoted,
@@ -299,21 +384,7 @@ contract QuadraticVoting is Ownable {
         );
     }
 
-    function getUserVotedPolls(
-        address user
-    ) external view returns (uint256[] memory) {
-        return users[user].votedPolls;
-    }
-
-    function getPollCount() external view returns (uint256) {
-        return polls.length;
-    }
-
-    // Internal helpers
-    function removeFromArray(
-        uint256[] storage arr, 
-        uint256 value
-    ) internal {
+    function removeFromArray(uint256[] storage arr, uint256 value) internal {
         for (uint256 i = 0; i < arr.length; i++) {
             if (arr[i] == value) {
                 arr[i] = arr[arr.length - 1];
