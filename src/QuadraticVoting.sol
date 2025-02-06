@@ -65,8 +65,19 @@ contract QuadraticVoting is Ownable {
     struct PollCore {
         string name;
         string description;
+        string ipfsHash;  // Added IPFS hash
         address creator;
         bool isActive;
+    }
+
+     struct PollView {
+        string name;
+        string description;
+        string ipfsHash;  // Added IPFS hash
+        address creator;
+        bool isActive;
+        uint256 totalVotes;
+        uint256 totalParticipants;
     }
 
     struct PollStats {
@@ -219,6 +230,7 @@ contract QuadraticVoting is Ownable {
         pollsCore[pollId] = PollCore({
             name: _name,
             description: _description,
+            ipfsHash: _ipfsHash,  // Store IPFS hash
             creator: msg.sender,
             isActive: true
         });
@@ -250,16 +262,9 @@ contract QuadraticVoting is Ownable {
         return false;
     }
 
-    struct PollView {
-        string name;
-        string description;
-        address creator;
-        bool isActive;
-        uint256 totalVotes;
-        uint256 totalParticipants;
-    }
+  
 
-    function getPollInfo(uint256 pollId) external view returns (PollView memory) {
+     function getPollInfo(uint256 pollId) external view returns (PollView memory) {
         if (pollId >= pollCount) revert("Poll does not exist");
         
         PollCore storage core = pollsCore[pollId];
@@ -268,6 +273,7 @@ contract QuadraticVoting is Ownable {
         return PollView({
             name: core.name,
             description: core.description,
+            ipfsHash: core.ipfsHash,  // Include IPFS hash
             creator: core.creator,
             isActive: core.isActive,
             totalVotes: stats.totalVotes,
@@ -277,11 +283,11 @@ contract QuadraticVoting is Ownable {
 
     function castVote(uint256 pollId, uint256 votingPower) external {
         if (pollId >= pollCount) revert("Poll does not exist");
-        if (votingPower == 0 || votingPower > MAX_VOTING_POWER) revert("Invalid voting power");
+        if (votingPower > MAX_VOTING_POWER) revert("Invalid voting power");
 
         UserInfo storage user = users[msg.sender];
         if (!user.isRegistered) revert("Not joined");
-        if (user.votedPolls.length >= MAX_VOTED_POLLS) revert("Too many votes");
+        if (user.votedPolls.length >= MAX_VOTED_POLLS && !votes[pollId][msg.sender].hasVoted) revert("Too many votes");
 
         PollCore storage core = pollsCore[pollId];
         if (!core.isActive) revert("Poll not active");
@@ -291,7 +297,7 @@ contract QuadraticVoting is Ownable {
         _processVote(pollId, votingPower, user);
     }
 
-    function _processVote(
+   function _processVote(
         uint256 pollId,
         uint256 votingPower,
         UserInfo storage user
@@ -299,16 +305,27 @@ contract QuadraticVoting is Ownable {
         Vote storage userVote = votes[pollId][msg.sender];
         PollStats storage stats = pollsStats[pollId];
 
-        // Handle previous vote refund
+        // Handle previous vote refund if exists
         if (userVote.hasVoted) {
             uint256 refundAmount = userVote.isVerified ? 
                 userVote.votingPower * userVote.votingPower : 1;
                 
             user.tokensLeft += refundAmount;
             stats.totalVotes -= userVote.votingPower;
+
+            if (votingPower == 0) {
+                // If setting to 0, remove from voted polls array and delete vote
+                if (stats.totalParticipants > 0) {
+                    stats.totalParticipants--;
+                }
+                removeFromArray(user.votedPolls, pollId);
+                delete votes[pollId][msg.sender];
+                emit VoteCast(msg.sender, pollId, 0, user.isVerified, 0);
+                return;
+            }
         }
 
-        // Calculate new vote cost
+        // Calculate new vote cost (only if not removing vote)
         uint256 voteCost;
         if (!user.isVerified) {
             if (votingPower != 1) revert("Regular users can only cast 1 vote");
@@ -319,7 +336,7 @@ contract QuadraticVoting is Ownable {
 
         if (user.tokensLeft < voteCost) revert("Insufficient tokens");
 
-        // Apply vote
+        // Apply new vote
         if (!userVote.hasVoted) {
             stats.totalParticipants++;
             user.votedPolls.push(pollId);
@@ -334,28 +351,6 @@ contract QuadraticVoting is Ownable {
         stats.totalVotes += votingPower;
 
         emit VoteCast(msg.sender, pollId, votingPower, user.isVerified, voteCost);
-    }
-
-    function removeVote(uint256 pollId) external {
-        if (pollId >= pollCount) revert("Poll does not exist");
-        
-        UserInfo storage user = users[msg.sender];
-        Vote storage userVote = votes[pollId][msg.sender];
-        PollStats storage stats = pollsStats[pollId];
-        
-        if (!userVote.hasVoted) revert("No vote to remove");
-
-        uint256 refundAmount = userVote.isVerified ? 
-            userVote.votingPower * userVote.votingPower : 1;
-
-        user.tokensLeft += refundAmount;
-        stats.totalVotes -= userVote.votingPower;
-        stats.totalParticipants--;
-
-        removeFromArray(user.votedPolls, pollId);
-        delete votes[pollId][msg.sender];
-        
-        emit VoteRemoved(msg.sender, pollId, refundAmount);
     }
 
     function togglePollStatus(uint256 pollId) external onlyOwner {
