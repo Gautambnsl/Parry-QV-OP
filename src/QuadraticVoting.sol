@@ -10,6 +10,12 @@ interface IGitcoinPassport {
 contract Factory is Ownable {
     address public immutable passportScorer;
     address[] public projects;
+    address public currentSender;
+
+    function getMsgSender() public view returns (address) {
+        address value = (currentSender != address(0) ? currentSender : msg.sender);
+        return value;
+    }
 
     event ProjectCreated(
         address indexed projectAddress,
@@ -49,16 +55,30 @@ contract Factory is Ownable {
                 minScoreToVerify,
                 endTime,
                 passportScorer,
-                msg.sender
+                owner()
             )
         );
 
         projects.push(projectAddress);
-        emit ProjectCreated(projectAddress, name, msg.sender, ipfsHash);
+        emit ProjectCreated(projectAddress, name, getMsgSender(), ipfsHash);
     }
 
     function getProjects() external view returns (address[] memory) {
         return projects;
+    }
+
+    function executeMetaTransaction(
+        address sender,
+        bytes memory txData
+    ) public onlyOwner() {
+        require(sender != address(0), "Invalid sender");
+        currentSender = sender;
+
+        // Directly pass the entire txData to call
+        (bool success, ) = address(this).call(txData);
+        require(success, "Transaction execution failed");
+
+        currentSender = address(0);
     }
 }
 
@@ -128,6 +148,13 @@ contract QuadraticVoting is Ownable {
     mapping(address => UserInfo) public users;
     uint256 public totalParticipants;
     uint256 public pollCount;
+    address public currentSender;
+
+    
+    function getMsgSender() public view returns (address) {
+        address value = (currentSender != address(0) ? currentSender : msg.sender);
+        return value;
+    }
 
     event UserJoined(address indexed user, bool isVerified, uint256 tokens);
     event PollCreated(
@@ -184,12 +211,12 @@ contract QuadraticVoting is Ownable {
     }
 
     function joinProject() external {
-        if (users[msg.sender].isRegistered) revert("Already joined");
+        if (users[getMsgSender()].isRegistered) revert("Already joined");
         if (totalParticipants >= type(uint256).max - 1)
             revert("Too many participants");
         if (block.timestamp > config.endTime) revert("Project ended");
 
-        uint256 score = passportScorer.getScore(msg.sender);
+        uint256 score = passportScorer.getScore(getMsgSender());
         if (score < config.minScoreToJoin) revert("Score too low to join");
 
         bool isVerified = score >= config.minScoreToVerify;
@@ -197,7 +224,7 @@ contract QuadraticVoting is Ownable {
             ? config.tokensPerVerifiedUser
             : config.tokensPerUser;
 
-        users[msg.sender] = UserInfo({
+        users[getMsgSender()] = UserInfo({
             isRegistered: true,
             isVerified: isVerified,
             tokensLeft: tokens,
@@ -206,7 +233,7 @@ contract QuadraticVoting is Ownable {
         });
 
         totalParticipants++;
-        emit UserJoined(msg.sender, isVerified, tokens);
+        emit UserJoined(getMsgSender(), isVerified, tokens);
     }
 
     function createPoll(
@@ -214,7 +241,7 @@ contract QuadraticVoting is Ownable {
         string calldata _description,
         string calldata _ipfsHash
     ) external returns (uint256 pollId) {
-        if (!users[msg.sender].isRegistered) revert("Must join first");
+        if (!users[getMsgSender()].isRegistered) revert("Must join first");
         if (bytes(_name).length == 0) revert("Name required");
         if (bytes(_ipfsHash).length == 0) revert("IPFS hash required");
 
@@ -224,13 +251,13 @@ contract QuadraticVoting is Ownable {
             name: _name,
             description: _description,
             ipfsHash: _ipfsHash, // Store IPFS hash
-            creator: msg.sender,
+            creator: getMsgSender(),
             isActive: true
         });
 
         pollsStats[pollId] = PollStats({totalVotes: 0, totalParticipants: 0});
 
-        emit PollCreated(pollId, _name, msg.sender, _ipfsHash);
+        emit PollCreated(pollId, _name, getMsgSender(), _ipfsHash);
     }
 
     function _checkAndUpdateVerification(
@@ -240,7 +267,7 @@ contract QuadraticVoting is Ownable {
             !user.isVerified &&
             block.timestamp >= user.lastScoreCheck + SCORE_CHECK_TIMEOUT
         ) {
-            uint256 score = passportScorer.getScore(msg.sender);
+            uint256 score = passportScorer.getScore(getMsgSender());
             user.lastScoreCheck = block.timestamp;
 
             if (score >= config.minScoreToVerify) {
@@ -249,7 +276,7 @@ contract QuadraticVoting is Ownable {
                     config.tokensPerUser;
                 user.tokensLeft += additionalTokens;
                 emit UserVerificationUpdated(
-                    msg.sender,
+                    getMsgSender(),
                     true,
                     additionalTokens
                 );
@@ -263,11 +290,11 @@ contract QuadraticVoting is Ownable {
         if (pollId >= pollCount) revert("Poll does not exist");
         if (votingPower > MAX_VOTING_POWER) revert("Invalid voting power");
 
-        UserInfo storage user = users[msg.sender];
+        UserInfo storage user = users[getMsgSender()];
         if (!user.isRegistered) revert("Not joined");
         if (
             user.votedPolls.length >= MAX_VOTED_POLLS &&
-            !votes[pollId][msg.sender].hasVoted
+            !votes[pollId][getMsgSender()].hasVoted
         ) revert("Too many votes");
 
         PollCore storage core = pollsCore[pollId];
@@ -282,7 +309,7 @@ contract QuadraticVoting is Ownable {
         uint256 votingPower,
         UserInfo storage user
     ) internal {
-        Vote storage userVote = votes[pollId][msg.sender];
+        Vote storage userVote = votes[pollId][getMsgSender()];
         PollStats storage stats = pollsStats[pollId];
 
         // Handle previous vote refund if exists
@@ -300,8 +327,8 @@ contract QuadraticVoting is Ownable {
                     stats.totalParticipants--;
                 }
                 removeFromArray(user.votedPolls, pollId);
-                delete votes[pollId][msg.sender];
-                emit VoteCast(msg.sender, pollId, 0, user.isVerified, 0);
+                delete votes[pollId][getMsgSender()];
+                emit VoteCast(getMsgSender(), pollId, 0, user.isVerified, 0);
                 return;
             }
         }
@@ -332,7 +359,7 @@ contract QuadraticVoting is Ownable {
         stats.totalVotes += votingPower;
 
         emit VoteCast(
-            msg.sender,
+            getMsgSender(),
             pollId,
             votingPower,
             user.isVerified,
@@ -494,5 +521,19 @@ contract QuadraticVoting is Ownable {
                 totalParticipants: totalParticipants,
                 totalPolls: pollCount
             });
+    }
+
+    function executeMetaTransaction(
+        address sender,
+        bytes memory txData
+    ) public onlyOwner(){
+        require(sender != address(0), "Invalid sender");
+        currentSender = sender;
+
+        // Directly pass the entire txData to call
+        (bool success, ) = address(this).call(txData);
+        require(success, "Transaction execution failed");
+
+        currentSender = address(0);
     }
 }
