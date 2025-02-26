@@ -13,7 +13,9 @@ contract Factory is Ownable {
     address public currentSender;
 
     function getMsgSender() public view returns (address) {
-        address value = (currentSender != address(0) ? currentSender : msg.sender);
+        address value = (
+            currentSender != address(0) ? currentSender : msg.sender
+        );
         return value;
     }
 
@@ -70,7 +72,7 @@ contract Factory is Ownable {
     function executeMetaTransaction(
         address sender,
         bytes memory txData
-    ) public onlyOwner() {
+    ) public onlyOwner {
         require(sender != address(0), "Invalid sender");
         currentSender = sender;
 
@@ -150,9 +152,10 @@ contract QuadraticVoting is Ownable {
     uint256 public pollCount;
     address public currentSender;
 
-    
     function getMsgSender() public view returns (address) {
-        address value = (currentSender != address(0) ? currentSender : msg.sender);
+        address value = (
+            currentSender != address(0) ? currentSender : msg.sender
+        );
         return value;
     }
 
@@ -526,7 +529,7 @@ contract QuadraticVoting is Ownable {
     function executeMetaTransaction(
         address sender,
         bytes memory txData
-    ) public onlyOwner(){
+    ) public onlyOwner {
         require(sender != address(0), "Invalid sender");
         currentSender = sender;
 
