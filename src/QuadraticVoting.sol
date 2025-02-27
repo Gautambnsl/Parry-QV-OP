@@ -11,6 +11,8 @@ contract Factory is Ownable {
     address public immutable passportScorer;
     address[] public projects;
     address public currentSender;
+    address public paymaster;
+
 
     function getMsgSender() public view returns (address) {
         address value = (
@@ -26,8 +28,19 @@ contract Factory is Ownable {
         string ipfsHash
     );
 
-    constructor(address _passportScorer) Ownable(msg.sender) {
+    constructor(address _passportScorer,address _paymaster) Ownable(msg.sender) {
         passportScorer = _passportScorer;
+        paymaster = _paymaster;
+    }
+
+    modifier onlyPaymaster() {
+        require(msg.sender == paymaster, "Only paymaster can execute this");
+        _;
+    }
+
+    function updatePaymaster(address _newPaymaster) external onlyOwner() {
+        require(_newPaymaster != address(0), "Invalid new paymaster address");
+        paymaster = _newPaymaster;
     }
 
     function createProject(
@@ -57,7 +70,7 @@ contract Factory is Ownable {
                 minScoreToVerify,
                 endTime,
                 passportScorer,
-                owner()
+                address(this)
             )
         );
 
@@ -72,7 +85,7 @@ contract Factory is Ownable {
     function executeMetaTransaction(
         address sender,
         bytes memory txData
-    ) public onlyOwner {
+    ) public onlyPaymaster {
         require(sender != address(0), "Invalid sender");
         currentSender = sender;
 
@@ -151,6 +164,12 @@ contract QuadraticVoting is Ownable {
     uint256 public totalParticipants;
     uint256 public pollCount;
     address public currentSender;
+
+    modifier onlyPaymaster() {
+        require(msg.sender == Factory(owner()).paymaster(), "Only paymaster can execute this");
+        _;
+    }
+
 
     function getMsgSender() public view returns (address) {
         address value = (
@@ -529,7 +548,7 @@ contract QuadraticVoting is Ownable {
     function executeMetaTransaction(
         address sender,
         bytes memory txData
-    ) public onlyOwner {
+    ) public onlyPaymaster {
         require(sender != address(0), "Invalid sender");
         currentSender = sender;
 
